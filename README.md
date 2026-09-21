@@ -814,13 +814,6 @@ This is a **personal/academic project** and currently does not specify an open-s
 
 ---
 
-## 👨‍💻 Author
-
-**Shahwaz Azam**
-
-Computer Science & Engineering — Data Science
-
----
 
 ## ⭐ Support
 
