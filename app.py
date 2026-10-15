@@ -606,25 +606,17 @@ if uploaded_files:
                 delete=False,
                 suffix=extension
             ) as tmp_file:
-
                 tmp_file.write(
                     uploaded_file.getvalue()
                 )
-
                 file_path = tmp_file.name
-
-
             try:
-
                 file_documents = (
                     load_single_file(
                         file_path
                     )
                 )
-
-
                 for doc in file_documents:
-
                     doc.metadata["filename"] = (
                         uploaded_file.name
                     )
@@ -632,16 +624,12 @@ if uploaded_files:
                     doc.metadata["source"] = (
                         uploaded_file.name
                     )
-
-
                 document_groups.append(
                     {
                         "filename": uploaded_file.name,
                         "documents": file_documents
                     }
                 )
-
-
                 documents.extend(
                     file_documents
                 )

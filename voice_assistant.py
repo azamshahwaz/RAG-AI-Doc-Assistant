@@ -7,7 +7,10 @@ import threading
 import time
 from rapidfuzz import fuzz
 import numpy as np
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    sd = None
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from faster_whisper import WhisperModel
@@ -132,17 +135,23 @@ llm = ChatGroq(
 # TEXT TO SPEECH
 # ============================================================
 
-import pyttsx3
 
-engine = pyttsx3.init()
+# TEXT TO SPEECH - optional on hosted servers
+try:
+    import pyttsx3
 
-engine.setProperty("rate", 170)
-engine.setProperty("volume", 1.0)
+    engine = pyttsx3.init()
+    engine.setProperty("rate", 170)
+    engine.setProperty("volume", 1.0)
 
-voices = engine.getProperty("voices")
+    voices = engine.getProperty("voices")
+    if voices:
+        engine.setProperty("voice", voices[0].id)
 
-if voices:
-    engine.setProperty("voice", voices[0].id)
+except Exception as e:
+    print("Local text-to-speech unavailable:", e)
+    engine = None
+
 
 
 # ============================================================
@@ -180,6 +189,7 @@ INITIAL_PROMPT = (
     "open GitHub, open LinkedIn, open Naukri"
 )
 
+# 
 # ============================================================
 # WHISPER DEVICE
 # ============================================================
@@ -367,7 +377,7 @@ def calculate_noise_floor():
             "Noise calibration error:",
             e
         )
-
+    if sd is None:
         return 0.01
 
 
@@ -404,6 +414,10 @@ def record_speech():
     silence_chunks_required = int(
         SILENCE_DURATION / CHUNK_DURATION
     )
+    
+    if sd is None:
+        print("Mircophone recording unavailable on this server")
+        return None
 
     # --------------------------------------------------------
     # PRE-ROLL BUFFER
