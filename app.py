@@ -78,6 +78,21 @@ st.set_page_config(
     layout="wide"
 )
 
+st.markdown("""
+<style>
+/* Hide Streamlit bottom-right decoration and profile avatar */
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"] {
+    display: none !important;
+}
+
+/* Hide Streamlit footer */
+footer {
+    visibility: hidden !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 # ============================================================
 # Persistent Login Session
