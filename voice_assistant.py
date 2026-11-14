@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import json
 import subprocess
 import webbrowser
 import datetime
@@ -7,69 +9,43 @@ import threading
 import time
 from rapidfuzz import fuzz
 import numpy as np
+
 try:
     import sounddevice as sd
 except (ImportError, OSError):
     sd = None
+
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from faster_whisper import WhisperModel
 
 # ============================================================
 # WEB SEARCH BACKEND
-# ============================================================
-# IMPORTANT:
-# `duckduckgo_search` has been RENAMED to `ddgs`. The old
-# package still installs but its requests are heavily rate
-# limited now, which is why web search silently returned
-# nothing. We import `ddgs` first and only fall back to the
-# old package if `ddgs` is not installed.
-#
-#     pip install -U ddgs
-#     pip uninstall duckduckgo_search
+#   pip install -U ddgs
 # ============================================================
 
 DDGS = None
 _DDGS_ERRORS = (Exception,)
 
 try:
-
     from ddgs import DDGS  # new package
 
     try:
-
         from ddgs.exceptions import (
             DDGSException,
             RatelimitException,
-            TimeoutException
-        )
-
-        _DDGS_ERRORS = (
-            RatelimitException,
             TimeoutException,
-            DDGSException
         )
-
+        _DDGS_ERRORS = (RatelimitException, TimeoutException, DDGSException)
     except Exception:
         pass
 
 except ImportError:
-
     try:
-
         from duckduckgo_search import DDGS  # legacy fallback
-
-        print(
-            "WARNING: using deprecated 'duckduckgo_search'. "
-            "Run: pip install -U ddgs"
-        )
-
+        print("WARNING: using deprecated 'duckduckgo_search'. Run: pip install -U ddgs")
     except ImportError:
-
-        print(
-            "ERROR: no search package installed. "
-            "Run: pip install -U ddgs"
-        )
+        print("ERROR: no search package installed. Run: pip install -U ddgs")
 
 import rag_engine
 
@@ -82,28 +58,17 @@ conversation_context = {
     "last_intent": "",
     "last_topic": "",
     "last_website": "",
-    "last_question": ""
+    "last_question": "",
 }
 
-# ============================================================
-# UPDATE CONVERSATION CONTEXT
-# ============================================================
 
-def update_context(
-    command,
-    intent="",
-    topic="",
-    website=""
-):
-
+def update_context(command, intent="", topic="", website=""):
     conversation_context["last_command"] = command
 
     if intent:
         conversation_context["last_intent"] = intent
-
     if topic:
         conversation_context["last_topic"] = topic
-
     if website:
         conversation_context["last_website"] = website
 
@@ -116,27 +81,57 @@ def update_context(
 
 load_dotenv()
 
-
-# ============================================================
-# GROQ LLM
-# ============================================================
-# Kept only for parity with the old standalone assistant. The
-# actual document/web question-answering below always goes
-# through rag_engine, not this raw client.
-# ============================================================
-
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
-    groq_api_key=os.getenv("GROQ_API_KEY")
+    groq_api_key=os.getenv("GROQ_API_KEY"),
 )
 
+# ============================================================
+# HOSTED vs LOCAL DETECTION
+# ============================================================
+# On a hosted server (Streamlit Cloud / Render ...) the server
+# is NOT the user's computer, so webbrowser.open() / subprocess
+# open tabs on the server, never in the user's browser.
+# There we send the URL to the user's browser instead.
+#
+# Override manually with an env var if detection is wrong:
+#   HOSTED_ENV=1  -> force hosted mode
+#   HOSTED_ENV=0  -> force local mode
+# ============================================================
+
+
+def is_hosted():
+    forced = os.getenv("HOSTED_ENV")
+
+    if forced == "1":
+        return True
+    if forced == "0":
+        return False
+
+    if (
+        os.path.exists("/mount/src")            # Streamlit Cloud
+        or os.getenv("RENDER")                  # Render
+        or os.getenv("STREAMLIT_SHARING_MODE")
+    ):
+        return True
+
+    if (
+        sys.platform.startswith("linux")
+        and not os.getenv("DISPLAY")
+        and not os.getenv("WAYLAND_DISPLAY")
+    ):
+        return True
+
+    return False
+
+
+HOSTED = is_hosted()
+print("Hosted mode:", HOSTED)
 
 # ============================================================
-# TEXT TO SPEECH
+# TEXT TO SPEECH - optional (not available on hosted servers)
 # ============================================================
 
-
-# TEXT TO SPEECH - optional on hosted servers
 try:
     import pyttsx3
 
@@ -151,8 +146,6 @@ try:
 except Exception as e:
     print("Local text-to-speech unavailable:", e)
     engine = None
-
-
 
 # ============================================================
 # WHISPER CONFIG
@@ -173,13 +166,6 @@ MIN_RMS_THRESHOLD = 0.004
 
 PRE_ROLL_DURATION = 0.5
 
-
-# ============================================================
-# DOMAIN PROMPT
-# ============================================================
-# The "open ..." phrases help Whisper recognise website names.
-# ============================================================
-
 INITIAL_PROMPT = (
     "software development, AI, machine learning, "
     "RAG, documents, PDF, certifications, "
@@ -189,37 +175,23 @@ INITIAL_PROMPT = (
     "open GitHub, open LinkedIn, open Naukri"
 )
 
-# 
-# ============================================================
-# WHISPER DEVICE
-# ============================================================
 
 def get_whisper_device():
-
     try:
-
         import torch
 
         if torch.cuda.is_available():
-
             return "cuda", "float16"
-
     except Exception:
-
         pass
 
     return "cpu", "int8"
 
 
-# ============================================================
-# LOAD WHISPER
-# ============================================================
-
 _whisper_model = None
 
 
 def get_whisper_model():
-
     global _whisper_model
 
     if _whisper_model is not None:
@@ -235,28 +207,18 @@ def get_whisper_model():
     print("=" * 60)
 
     try:
-
         _whisper_model = WhisperModel(
-            WHISPER_MODEL,
-            device=device,
-            compute_type=compute_type
+            WHISPER_MODEL, device=device, compute_type=compute_type
         )
-
     except Exception as e:
-
         print("Whisper GPU initialization failed:")
         print(e)
-
         print("Falling back to CPU...")
-
         _whisper_model = WhisperModel(
-            WHISPER_MODEL,
-            device="cpu",
-            compute_type="int8"
+            WHISPER_MODEL, device="cpu", compute_type="int8"
         )
 
     print("Whisper loaded successfully.")
-
     return _whisper_model
 
 
@@ -265,119 +227,72 @@ def get_whisper_model():
 # ============================================================
 
 def speak(text):
-
     if not text:
         return
 
     text = str(text)
-
     print("\nAssistant:", text)
 
-    try:
+    if engine is None:
+        return
 
+    try:
         engine.say(text)
         engine.runAndWait()
-
     except Exception as e:
-
         print("TTS Error:", e)
 
 
 # ============================================================
-# AUDIO RMS
+# AUDIO HELPERS
 # ============================================================
 
 def calculate_rms(audio):
-
-    audio = np.asarray(
-        audio,
-        dtype=np.float32
-    )
+    audio = np.asarray(audio, dtype=np.float32)
 
     if audio.size == 0:
         return 0.0
 
-    return float(
-        np.sqrt(
-            np.mean(
-                np.square(audio)
-            )
-        )
-    )
+    return float(np.sqrt(np.mean(np.square(audio))))
 
-
-# ============================================================
-# AUDIO NORMALIZATION
-# ============================================================
 
 def normalize_audio(audio):
-
-    audio = np.asarray(
-        audio,
-        dtype=np.float32
-    )
+    audio = np.asarray(audio, dtype=np.float32)
 
     if audio.size == 0:
         return audio
 
-    # Remove DC offset
-    audio = audio - np.mean(audio)
+    audio = audio - np.mean(audio)  # remove DC offset
 
-    peak = np.max(
-        np.abs(audio)
-    )
+    peak = np.max(np.abs(audio))
 
-    if peak > 0:
+    if peak > 0.95:
+        audio = (audio / peak) * 0.95
 
-        if peak > 0.95:
+    return audio.astype(np.float32)
 
-            audio = (
-                audio / peak
-            ) * 0.95
-
-    return audio.astype(
-        np.float32
-    )
-
-
-# ============================================================
-# NOISE CALIBRATION
-# ============================================================
 
 def calculate_noise_floor():
+    if sd is None:
+        return 0.01
 
     try:
-
         calibration_duration = 0.5
 
-        print(
-            "Calibrating microphone..."
-            " Please stay silent."
-        )
+        print("Calibrating microphone... Please stay silent.")
 
         audio = sd.rec(
-            int(
-                calibration_duration
-                * SAMPLE_RATE
-            ),
+            int(calibration_duration * SAMPLE_RATE),
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
-            dtype="float32"
+            dtype="float32",
         )
-
         sd.wait()
 
-        audio = audio.flatten()
-
-        return calculate_rms(audio)
+        return calculate_rms(audio.flatten())
 
     except Exception as e:
-
-        print(
-            "Noise calibration error:",
-            e
-        )
-    if sd is None:
+        print("Noise calibration error:", e)
         return 0.01
 
 
@@ -387,51 +302,25 @@ def calculate_noise_floor():
 
 def record_speech():
 
+    if sd is None:
+        print("Microphone recording unavailable on this server")
+        return None
+
     print("\nListening...")
 
     noise_floor = calculate_noise_floor()
-
-    threshold = max(
-        MIN_RMS_THRESHOLD,
-        noise_floor * 2.0
-    )
+    threshold = max(MIN_RMS_THRESHOLD, noise_floor * 2.0)
 
     print(f"Noise floor: {noise_floor:.5f}")
     print(f"Speech threshold: {threshold:.5f}")
 
-    chunk_samples = int(
-        SAMPLE_RATE * CHUNK_DURATION
-    )
-
-    max_chunks = int(
-        MAX_RECORD_SECONDS / CHUNK_DURATION
-    )
-
-    timeout_chunks = int(
-        START_TIMEOUT / CHUNK_DURATION
-    )
-
-    silence_chunks_required = int(
-        SILENCE_DURATION / CHUNK_DURATION
-    )
-    
-    if sd is None:
-        print("Mircophone recording unavailable on this server")
-        return None
-
-    # --------------------------------------------------------
-    # PRE-ROLL BUFFER
-    # Keeps audio from just before speech detection.
-    # This prevents first words from being cut.
-    # --------------------------------------------------------
-
-    pre_roll_chunks_required = max(
-        1,
-        int(PRE_ROLL_DURATION / CHUNK_DURATION)
-    )
+    chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION)
+    max_chunks = int(MAX_RECORD_SECONDS / CHUNK_DURATION)
+    timeout_chunks = int(START_TIMEOUT / CHUNK_DURATION)
+    silence_chunks_required = int(SILENCE_DURATION / CHUNK_DURATION)
+    pre_roll_chunks_required = max(1, int(PRE_ROLL_DURATION / CHUNK_DURATION))
 
     pre_roll = []
-
     audio_chunks = []
 
     speech_started = False
@@ -439,69 +328,40 @@ def record_speech():
     chunks_waited = 0
 
     try:
-
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="float32",
-            blocksize=chunk_samples
+            blocksize=chunk_samples,
         ) as stream:
 
             for _ in range(max_chunks):
 
-                data, overflowed = stream.read(
-                    chunk_samples
-                )
-
+                data, overflowed = stream.read(chunk_samples)
                 chunk = data[:, 0].copy()
-
                 rms = calculate_rms(chunk)
 
                 if overflowed:
-                    print(
-                        "Warning: microphone overflow."
-                    )
-
-                # =================================================
-                # BEFORE SPEECH
-                # =================================================
+                    print("Warning: microphone overflow.")
 
                 if not speech_started:
 
                     chunks_waited += 1
 
-                    # Keep recent audio
                     pre_roll.append(chunk)
-
                     if len(pre_roll) > pre_roll_chunks_required:
                         pre_roll.pop(0)
 
                     if rms >= threshold:
-
                         speech_started = True
-
-                        print(
-                            "Speech detected."
-                        )
-
-                        # IMPORTANT:
-                        # Include audio from just before detection.
+                        print("Speech detected.")
                         audio_chunks.extend(pre_roll)
 
                     elif chunks_waited >= timeout_chunks:
-
-                        print(
-                            "No speech detected."
-                        )
-
+                        print("No speech detected.")
                         break
 
-                # =================================================
-                # SPEECH IN PROGRESS
-                # =================================================
-
                 else:
-
                     audio_chunks.append(chunk)
 
                     if rms < threshold:
@@ -510,180 +370,83 @@ def record_speech():
                         silence_count = 0
 
                     if silence_count >= silence_chunks_required:
-
-                        print(
-                            "Speech ended."
-                        )
-
+                        print("Speech ended.")
                         break
 
     except Exception as e:
-
-        print(
-            "Microphone error:",
-            e
-        )
-
+        print("Microphone error:", e)
         return None
 
     if not audio_chunks:
         return None
 
-    audio = np.concatenate(audio_chunks)
-
-    audio = normalize_audio(audio)
-
+    audio = normalize_audio(np.concatenate(audio_chunks))
     duration = len(audio) / SAMPLE_RATE
 
-    print(
-        f"Recorded: {duration:.2f} seconds"
-    )
+    print(f"Recorded: {duration:.2f} seconds")
 
     if duration < 0.35:
         return None
 
     return audio
 
+
 # ============================================================
-# CLEAN TRANSCRIPT
+# TRANSCRIPT CLEANING / VALIDATION
 # ============================================================
 
 def clean_transcript(text):
-
     if not text:
         return ""
 
     text = str(text).strip()
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    text = re.sub(
-        r"([.!?,])\1{2,}",
-        r"\1",
-        text
-    )
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"([.!?,])\1{2,}", r"\1", text)
 
     return text.strip()
 
 
-# ============================================================
-# TRANSCRIPT VALIDATION
-# ============================================================
-
 def is_valid_transcript(text):
-
     if not text:
         return False
 
     text = text.strip()
 
-    if len(text) < 2:
-        return False
-
-    if len(text) > 1000:
+    if len(text) < 2 or len(text) > 1000:
         return False
 
     words = text.lower().split()
 
-    # --------------------------------------------------------
     # Repeated word protection
-    # --------------------------------------------------------
-
     if len(words) >= 8:
-
-        unique_words = set(words)
-
-        repetition_ratio = (
-            len(unique_words)
-            / len(words)
-        )
-
-        if repetition_ratio < 0.25:
-
+        if len(set(words)) / len(words) < 0.25:
             return False
 
-    # --------------------------------------------------------
     # Repeated phrase protection
-    # --------------------------------------------------------
-
     if len(words) >= 12:
-
-        for phrase_size in [2, 3, 4]:
-
-            phrases = []
-
-            for i in range(
-                len(words)
-                - phrase_size
-                + 1
-            ):
-
-                phrase = " ".join(
-                    words[
-                        i:
-                        i + phrase_size
-                    ]
-                )
-
-                phrases.append(
-                    phrase
-                )
-
+        for phrase_size in (2, 3, 4):
             counts = {}
 
-            for phrase in phrases:
+            for i in range(len(words) - phrase_size + 1):
+                phrase = " ".join(words[i:i + phrase_size])
+                counts[phrase] = counts.get(phrase, 0) + 1
 
-                counts[phrase] = (
-                    counts.get(
-                        phrase,
-                        0
-                    )
-                    + 1
-                )
+            if counts and max(counts.values()) >= 4:
+                return False
 
-            if counts:
-
-                highest = max(
-                    counts.values()
-                )
-
-                if highest >= 4:
-
-                    return False
-
-    # --------------------------------------------------------
-    # Known Whisper hallucination phrases
-    # --------------------------------------------------------
-
-    suspicious_phrases = [
-
+    # Known Whisper hallucinations
+    suspicious_phrases = (
         "thank you for watching",
-
         "thanks for watching",
-
         "please subscribe",
-
         "subscribe to my channel",
-
         "see you in the next video",
-
         "subtitles by",
+        "amara.org",
+    )
 
-        "amara.org"
-
-    ]
-
-    lowered = text.lower()
-
-    for phrase in suspicious_phrases:
-
-        if lowered == phrase:
-
-            return False
+    if text.lower() in suspicious_phrases:
+        return False
 
     return True
 
@@ -693,11 +456,7 @@ def is_valid_transcript(text):
 # ============================================================
 
 def transcribe_audio(audio):
-
-    if audio is None:
-        return ""
-
-    if len(audio) == 0:
+    if audio is None or len(audio) == 0:
         return ""
 
     model = get_whisper_model()
@@ -706,108 +465,55 @@ def transcribe_audio(audio):
         segments, info = model.transcribe(
             audio,
             language="en",
-
-            # Better accuracy
             beam_size=3,
             best_of=3,
             temperature=0.0,
-
-            # Prevent previous text from influencing transcription
             condition_on_previous_text=False,
-
-            # Hallucination protection
             compression_ratio_threshold=2.4,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
-
-            # VAD - ignore silence/noise
             vad_filter=True,
             vad_parameters={
                 "min_silence_duration_ms": 500,
-                "speech_pad_ms": 400
+                "speech_pad_ms": 400,
             },
-            initial_prompt=INITIAL_PROMPT
+            initial_prompt=INITIAL_PROMPT,
         )
 
         texts = []
 
         for segment in segments:
-
             text = segment.text.strip()
 
             if not text:
                 continue
 
-            avg_logprob = getattr(
-                segment,
-                "avg_logprob",
-                0.0
-            )
-
-            no_speech_prob = getattr(
-                segment,
-                "no_speech_prob",
-                0.0
-            )
-
-            compression_ratio = getattr(
-                segment,
-                "compression_ratio",
-                0.0
-            )
-
-            if no_speech_prob >= 0.85:
+            if getattr(segment, "no_speech_prob", 0.0) >= 0.85:
                 continue
-
-            if avg_logprob < -1.5:
+            if getattr(segment, "avg_logprob", 0.0) < -1.5:
                 continue
-
-            if compression_ratio > 3.0:
+            if getattr(segment, "compression_ratio", 0.0) > 3.0:
                 continue
 
             texts.append(text)
 
-        # No valid speech
         if not texts:
             return ""
 
-        # Combine segments
-        transcript = " ".join(texts)
+        transcript = clean_transcript(" ".join(texts))
 
-        # Clean transcript
-        transcript = clean_transcript(transcript)
-
-        # Final validation
         if not is_valid_transcript(transcript):
-
             print("Suspicious transcript rejected:")
             print(transcript)
-
             return ""
 
-        # Detected language
-        detected_language = getattr(
-            info,
-            "language",
-            "unknown"
-        )
-
-        print(
-            "Detected language:",
-            detected_language
-        )
-
-        print(
-            "You:",
-            transcript
-        )
+        print("Detected language:", getattr(info, "language", "unknown"))
+        print("You:", transcript)
 
         return transcript.lower()
+
     except Exception as e:
-        print(
-            "Whisper error:",
-            e
-        )
+        print("Whisper error:", e)
         return ""
 
 
@@ -815,48 +521,27 @@ def transcribe_audio(audio):
 # MAIN LISTEN FUNCTION
 # ============================================================
 
-def listen(
-    duration=4,
-    sample_rate=16000
-):
-
+def listen(duration=4, sample_rate=16000):
     try:
-
         audio = record_speech()
 
         if audio is None:
-
-            print(
-                "No speech captured."
-            )
-
+            print("No speech captured.")
             return ""
 
-        transcript = transcribe_audio(
-            audio
-        )
+        transcript = transcribe_audio(audio)
 
         if not transcript:
-
-            print(
-                "Could not understand speech."
-            )
-
+            print("Could not understand speech.")
             return ""
 
         return transcript
 
     except KeyboardInterrupt:
-
         return ""
 
     except Exception as e:
-
-        print(
-            "Listen error:",
-            e
-        )
-
+        print("Listen error:", e)
         return ""
 
 
@@ -864,104 +549,111 @@ def listen(
 # REMINDER
 # ============================================================
 
-def set_reminder(
-    message,
-    seconds
-):
+def set_reminder(message, seconds):
 
     def reminder():
-
         time.sleep(seconds)
+        speak(f"Reminder: {message}")
 
-        speak(
-            f"Reminder: {message}"
+    threading.Thread(target=reminder, daemon=True).start()
+
+
+# ============================================================
+# OPEN URL  (LOCAL: server-side Chrome | HOSTED: user's browser)
+# ============================================================
+
+def _push_to_browser(url):
+    """
+    HOSTED MODE: open `url` in the USER's browser.
+
+    1. Tries window.open() via a tiny hidden component. Browsers
+       may block this (popup blocker) because a voice/text
+       command is not a direct click.
+    2. ALWAYS also shows a clickable button - a real user click
+       is never blocked, so this is the guaranteed fallback.
+    """
+
+    try:
+        import streamlit as st
+        import streamlit.components.v1 as components
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is None:
+            print("No Streamlit context - cannot send URL to browser.")
+            return False
+
+        st.session_state["pending_open_url"] = url
+
+        components.html(
+            f"<script>window.open({json.dumps(url)}, '_blank');</script>",
+            height=0,
         )
 
-    threading.Thread(
-        target=reminder,
-        daemon=True
-    ).start()
+        st.link_button(f"🌐 Open {url}", url)
 
-# ============================================================
-# OPEN URL IN NEW CHROME TAB
-# ============================================================
+        return True
+
+    except Exception as e:
+        print("Browser push failed:", e)
+        return False
+
+
+def render_pending_link():
+    """
+    OPTIONAL. Call this in app.py AFTER the chat/answer is drawn,
+    only if the button disappears after a Streamlit rerun.
+    """
+
+    try:
+        import streamlit as st
+
+        url = st.session_state.get("pending_open_url")
+
+        if url:
+            st.link_button(f"🌐 Open {url}", url, key=f"open_{abs(hash(url))}")
+
+    except Exception as e:
+        print("render_pending_link error:", e)
+
 
 def open_url_in_new_chrome_tab(url):
     """
     Opens `url` in a NEW tab.
 
-    - If Chrome is installed, it is launched with --new-tab
-      (if Chrome is already running, the site opens as a new tab
-      in the existing window).
-    - Otherwise falls back to the default browser, also in a new tab.
+    - Hosted server: sends the URL to the user's browser.
+    - Local Windows: Chrome with --new-tab if installed.
+    - Otherwise: default browser, new tab.
     """
 
+    if HOSTED:
+        return _push_to_browser(url)
+
     chrome_paths = [
-
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-
         os.path.expandvars(
             r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
-        )
+        ),
     ]
 
-    chrome_path = None
-
-    for path in chrome_paths:
-
-        if os.path.exists(path):
-
-            chrome_path = path
-
-            break
+    chrome_path = next((p for p in chrome_paths if os.path.exists(p)), None)
 
     if chrome_path:
-
         try:
-
-            subprocess.Popen([
-                chrome_path,
-                "--new-tab",
-                url
-            ])
-
+            subprocess.Popen([chrome_path, "--new-tab", url])
             return True
-
         except Exception as e:
-
             print("Chrome launch failed, using default browser:", e)
 
     webbrowser.open_new_tab(url)
-
     return True
 
 
 # ============================================================
-# SAFE WEB SEARCH  (THE ACTUAL FIX)
-# ============================================================
-# Problems that made the old code fail silently:
-#
-#   1. `duckduckgo_search` is deprecated -> constant rate limits.
-#   2. A single failed call returned nothing with no retry.
-#   3. Only the DuckDuckGo backend was used; when it throttles,
-#      everything dies. `ddgs` can fall back to Bing / Brave /
-#      Mojeek / Yahoo.
-#   4. Result dictionaries use different keys across versions
-#      ("href" vs "link" vs "url"), so URLs came back empty.
-#
-# This helper fixes all four and always returns a list of
-# normalised dicts: {"title": ..., "url": ..., "body": ...}
+# SAFE WEB SEARCH
 # ============================================================
 
-SEARCH_BACKENDS = [
-    "duckduckgo",
-    "bing",
-    "brave",
-    "mojeek",
-    "yahoo",
-]
+SEARCH_BACKENDS = ["duckduckgo", "bing", "brave", "mojeek", "yahoo"]
 
 
 def _normalise_result(result):
@@ -971,17 +663,10 @@ def _normalise_result(result):
         return None
 
     url = (
-        result.get("href")
-        or result.get("url")
-        or result.get("link")
-        or ""
+        result.get("href") or result.get("url") or result.get("link") or ""
     ).strip()
 
-    title = (
-        result.get("title")
-        or result.get("name")
-        or ""
-    ).strip()
+    title = (result.get("title") or result.get("name") or "").strip()
 
     body = (
         result.get("body")
@@ -990,32 +675,14 @@ def _normalise_result(result):
         or ""
     ).strip()
 
-    if not url:
+    if not url or not url.startswith(("http://", "https://")):
         return None
 
-    if not url.startswith(("http://", "https://")):
-        return None
-
-    return {
-        "title": title or url,
-        "url": url,
-        "body": body
-    }
+    return {"title": title or url, "url": url, "body": body}
 
 
-def web_search(
-    query,
-    max_results=5,
-    region="in-en",
-    retries=2
-):
-    """
-    Rate-limit tolerant web search.
-
-    Tries each backend in turn, with a short backoff between
-    attempts. Returns [] instead of raising, so callers never
-    crash on a throttled search.
-    """
+def web_search(query, max_results=5, region="in-en", retries=2):
+    """Rate-limit tolerant search. Returns [] instead of raising."""
 
     if DDGS is None:
         print("Search unavailable: run  pip install -U ddgs")
@@ -1031,78 +698,50 @@ def web_search(
         for attempt in range(retries + 1):
 
             try:
-
                 with DDGS() as ddgs:
-
                     try:
-
                         raw = ddgs.text(
                             query,
                             region=region,
                             safesearch="moderate",
                             max_results=max_results,
-                            backend=backend
+                            backend=backend,
                         )
-
                     except TypeError:
-
                         # Legacy duckduckgo_search has no `backend`
                         raw = ddgs.text(
                             query,
                             region=region,
                             safesearch="moderate",
-                            max_results=max_results
+                            max_results=max_results,
                         )
 
                     results = []
-
                     for item in (raw or []):
-
                         clean = _normalise_result(item)
-
                         if clean:
                             results.append(clean)
 
                 if results:
-
-                    print(
-                        f"Search OK via '{backend}': "
-                        f"{len(results)} results"
-                    )
-
+                    print(f"Search OK via '{backend}': {len(results)} results")
                     return results
 
-                # Empty response usually means soft rate limiting
-                print(
-                    f"Backend '{backend}' returned nothing "
-                    f"(attempt {attempt + 1})"
-                )
+                print(f"Backend '{backend}' returned nothing (attempt {attempt + 1})")
 
             except _DDGS_ERRORS as e:
-
-                print(
-                    f"Backend '{backend}' error "
-                    f"(attempt {attempt + 1}): {e}"
-                )
+                print(f"Backend '{backend}' error (attempt {attempt + 1}): {e}")
 
             if attempt < retries:
                 time.sleep(1.5 * (attempt + 1))
 
-        # Small pause before switching engine
         time.sleep(0.5)
 
     print("All search backends failed for:", query)
-
     return []
 
 
 # ============================================================
 # KNOWN WEBSITES
-# ============================================================
-# Direct name -> URL map for common sites. This lets us open
-# these INSTANTLY (no web search needed), exactly like the
-# "Quick Actions" buttons in the app — faster and more
-# reliable than trusting whatever a web search returns first.
 # ============================================================
 
 KNOWN_WEBSITES = {
@@ -1136,31 +775,32 @@ KNOWN_WEBSITES = {
     "spotify": "https://open.spotify.com",
 }
 
-# Matches things like  example.com  /  www.example.co.in  /  site.com/page
+# Matches: example.com / www.example.co.in / site.com/page
 DOMAIN_PATTERN = re.compile(
     r"^(https?://)?([a-z0-9-]+\.)+[a-z]{2,}(/\S*)?$"
 )
 
+
 def resolve_website_name(name):
     name = name.lower().strip()
+
     best_match = None
     best_score = 0
+
     for website in KNOWN_WEBSITES:
-        score = fuzz.ratio(
-            name,
-            website
-)
+        score = fuzz.ratio(name, website)
 
         if score > best_score:
             best_score = score
             best_match = website
-    print(
-        f"Website match: {name} -> "
-        f"{best_match} ({best_score})"
-    )
+
+    print(f"Website match: {name} -> {best_match} ({best_score})")
+
     if best_score >= 70:
         return best_match
+
     return name
+
 
 # ============================================================
 # SEARCH AND OPEN ANY WEBSITE
@@ -1168,35 +808,33 @@ def resolve_website_name(name):
 
 def search_and_open_website(website_name, announce=True):
     """
-    Open a website in a NEW TAB.
-
-    Order of resolution:
+    Resolution order:
       1. Full domain / URL  (example.com)   -> opened directly
       2. Known website map  (youtube, ...)  -> opened directly
-      3. Anything else                      -> web search,
-                                               best result opened
+      3. Anything else                      -> web search, best result
 
-    announce=True speaks the result through the local pyttsx3
-    engine (used by the standalone CLI assistant). Pass
-    announce=False when a caller (like the Streamlit app) wants
-    to handle the speaking/display itself.
-
-    Returns:
-        (success, message)
+    Returns (success, message)
     """
+
     def respond(message, success):
         if announce and message:
             speak(message)
         return success, message
+
+    def opened_message(name):
+        if HOSTED:
+            return (
+                f"Opening {name} in a new tab. "
+                f"Agar tab na khule, neeche wala button dabaiye."
+            )
+        return f"Opening {name} in a new tab."
+
     website_name = (website_name or "").strip().lower()
+
     if not website_name:
-        return respond(
-            "Please tell me the website name.",
-            False
-        )
-    # ----------------------------------------------------
-    # DIRECT DOMAIN / URL  (example.com)
-    # ----------------------------------------------------
+        return respond("Please tell me the website name.", False)
+
+    # ---------------- DIRECT DOMAIN / URL ----------------
 
     if DOMAIN_PATTERN.match(website_name):
 
@@ -1206,7 +844,7 @@ def search_and_open_website(website_name, announce=True):
             url = "https://" + url
 
         print("\n" + "=" * 60)
-        print("DOMAIN — OPENING DIRECTLY")
+        print("DOMAIN - OPENING DIRECTLY")
         print("URL:", url)
         print("=" * 60)
 
@@ -1215,150 +853,95 @@ def search_and_open_website(website_name, announce=True):
         update_context(
             command=f"open {website_name}",
             intent="open_website",
-            website=website_name
+            website=website_name,
         )
 
-        return respond(
-            f"Opening {website_name} in a new tab.",
-            True
-        )
+        return respond(opened_message(website_name), True)
 
-    resolved_name = resolve_website_name(
-        website_name
-    )
+    resolved_name = resolve_website_name(website_name)
 
     if not resolved_name:
+        return respond("Please tell me the website name.", False)
 
-        return respond(
-            "Please tell me the website name.",
-            False
-        )
-
-    # ----------------------------------------------------
-    # FAST PATH — known website, open instantly
-    # ----------------------------------------------------
+    # ---------------- KNOWN WEBSITE ----------------
 
     if resolved_name in KNOWN_WEBSITES:
 
         selected_url = KNOWN_WEBSITES[resolved_name]
 
         print("\n" + "=" * 60)
-        print("KNOWN WEBSITE — OPENING DIRECTLY")
+        print("KNOWN WEBSITE - OPENING DIRECTLY")
         print("URL:", selected_url)
         print("=" * 60)
 
-        open_url_in_new_chrome_tab(
-            selected_url
-        )
+        open_url_in_new_chrome_tab(selected_url)
 
         update_context(
             command=f"open {resolved_name}",
             intent="open_website",
-            website=resolved_name
+            website=resolved_name,
         )
 
-        return respond(
-            f"Opening {resolved_name} in a new tab.",
-            True
-        )
+        return respond(opened_message(resolved_name), True)
 
-    # ----------------------------------------------------
-    # FALLBACK — unknown website, search for it
-    # ----------------------------------------------------
+    # ---------------- UNKNOWN WEBSITE: SEARCH ----------------
 
     website_name = resolved_name
 
     print("\n" + "=" * 60)
     print("WEBSITE SEARCH")
     print("=" * 60)
+    print("Searching for:", website_name)
 
-    print(
-        "Searching for:",
-        website_name
-    )
+    results = web_search(f"{website_name} official website", max_results=5)
 
-    results = web_search(
-        f"{website_name} official website",
-        max_results=5
-    )
-
-    # ----------------------------------------------------
-    # LAST RESORT
-    # If every search backend is throttled, guess the most
-    # likely domain instead of giving up. A wrong guess is
-    # still better than "I could not find that website".
-    # ----------------------------------------------------
-
+    # Last resort: guess the domain
     if not results:
 
         guess = re.sub(r"[^a-z0-9]", "", website_name)
 
         if guess:
-
             guessed_url = f"https://www.{guess}.com"
 
-            print("Search failed — trying guessed URL:", guessed_url)
+            print("Search failed - trying guessed URL:", guessed_url)
 
             open_url_in_new_chrome_tab(guessed_url)
 
             update_context(
                 command=f"open {website_name}",
                 intent="open_website",
-                website=website_name
+                website=website_name,
             )
 
             return respond(
-                f"Search was unavailable, so I opened "
-                f"{guess} dot com in a new tab.",
-                True
+                f"Search was unavailable, so I opened {guess} dot com in a new tab.",
+                True,
             )
 
-        return respond(
-            f"I could not find the website {website_name}.",
-            False
-        )
-
-    # ----------------------------------------------------
-    # BEST RESULT
-    # ----------------------------------------------------
+        return respond(f"I could not find the website {website_name}.", False)
 
     best = results[0]
 
-    selected_url = best["url"]
-    selected_title = best["title"]
+    print("Website title:", best["title"])
+    print("Website URL:", best["url"])
 
-    print("Website title:", selected_title)
-    print("Website URL:", selected_url)
-
-    open_url_in_new_chrome_tab(
-        selected_url
-    )
+    open_url_in_new_chrome_tab(best["url"])
 
     update_context(
         command=f"open {website_name}",
         intent="open_website",
-        website=website_name
+        website=website_name,
     )
 
     print("=" * 60)
     print("WEBSITE OPENED IN NEW TAB")
     print("=" * 60)
 
-    return respond(
-        f"Opening {website_name} in a new tab.",
-        True
-    )
+    return respond(opened_message(website_name), True)
 
 
 # ============================================================
 # UPLOADED DOCUMENT VECTORSTORE (cached, standalone CLI use)
-# ============================================================
-# When voice_assistant.py runs on its own (python voice_assistant.py)
-# there is no Streamlit session, so we load whatever vectorstore was
-# last saved to disk by rag_engine. When it's imported from app.py,
-# the caller passes the LIVE Streamlit session's FAISS db into
-# voice_answer()/process_command() instead, and this cached one is
-# simply not used.
 # ============================================================
 
 _cached_db = None
@@ -1366,11 +949,9 @@ _db_loaded = False
 
 
 def get_document_db():
-
     global _cached_db, _db_loaded
 
     if not _db_loaded:
-
         try:
             _cached_db = rag_engine.load_vectorstore()
         except Exception as e:
@@ -1387,10 +968,6 @@ def get_document_db():
 # ============================================================
 
 def describe_source(source_type):
-    """
-    Short spoken/printed note about where the answer came from, so
-    the user always gets a reference instead of a bare answer.
-    """
 
     if source_type == "document":
         return "Yeh jankari maine aapke uploaded document se li hai."
@@ -1404,7 +981,8 @@ def describe_source(source_type):
     return ""
 
 
-def format_document_sources(doc_sources, limit=3):
+def format_document_sources(doc_sources, limit=None):
+    """Lists every (already filtered) source doc. No fixed cap."""
 
     if not doc_sources:
         return ""
@@ -1440,7 +1018,7 @@ def format_document_sources(doc_sources, limit=3):
         seen.add(key)
         lines.append(f"- {os.path.basename(str(filename))} ({location})")
 
-        if len(lines) >= limit:
+        if limit and len(lines) >= limit:
             break
 
     return "\n".join(lines)
@@ -1460,13 +1038,7 @@ def format_web_sources(web_sources, limit=3):
 
         title = source.get("title", "Unknown source")
 
-        # Accept every key variant, so sources never print blank
-        url = (
-            source.get("url")
-            or source.get("href")
-            or source.get("link")
-            or ""
-        )
+        url = source.get("url") or source.get("href") or source.get("link") or ""
 
         if url:
             lines.append(f"{index}. {title} - {url}")
@@ -1478,33 +1050,24 @@ def format_web_sources(web_sources, limit=3):
 
 def voice_answer(question, db=None, context=None):
     """
-    Single entry point used by BOTH the Streamlit app and this
-    standalone CLI assistant.
+    Single entry point used by BOTH the Streamlit app and the CLI.
 
-    Returns:
-        answer_text, reference_note, sources, source_type
+    Returns: answer_text, reference_note, sources, source_type
     """
 
     try:
         answer, sources, source_type = rag_engine.answer_question(question, db)
 
     except rag_engine.RateLimitError as e:
-
         return (
             f"Groq ka daily token limit khatam ho gaya hai. {str(e)}",
             "",
             [],
-            "error"
+            "error",
         )
 
     except Exception as e:
-
-        return (
-            f"Sorry, ek error aa gaya: {e}",
-            "",
-            [],
-            "error"
-        )
+        return f"Sorry, ek error aa gaya: {e}", "", [], "error"
 
     reference_note = describe_source(source_type)
 
@@ -1529,7 +1092,6 @@ def voice_answer(question, db=None, context=None):
 
         if docs_text:
             reference_note += "\nDocuments:\n" + docs_text
-
         if web_text:
             reference_note += "\nWeb:\n" + web_text
 
@@ -1537,22 +1099,10 @@ def voice_answer(question, db=None, context=None):
 
 
 # ============================================================
-# "OPEN ..." COMMAND PARSING
-# ============================================================
-# Understands (English + Hinglish):
-#   open youtube            open youtube in a new tab
-#   launch github           go to linkedin      visit naukri
-#   youtube kholo           google khol do      gmail open karo
-#   open flipkart dot com   open example.com
+# "OPEN ..." COMMAND PARSING (English + Hinglish)
 # ============================================================
 
-OPEN_PREFIXES = (
-    "open ",
-    "launch ",
-    "go to ",
-    "goto ",
-    "visit ",
-)
+OPEN_PREFIXES = ("open ", "launch ", "go to ", "goto ", "visit ")
 
 OPEN_SUFFIXES = (
     " kholo",
@@ -1566,71 +1116,52 @@ OPEN_SUFFIXES = (
     " open kijiye",
 )
 
-# Words that must not be treated as a website/app name.
 MAX_OPEN_TARGET_WORDS = 4
 
 
 def extract_open_target(command):
-    """
-    Returns the thing the user wants opened (e.g. "youtube"),
-    or None if `command` is not an "open ..." style command.
-    """
+    """Returns the thing to open (e.g. "youtube"), or None."""
 
     target = None
 
     for prefix in OPEN_PREFIXES:
-
         if command.startswith(prefix):
-
             target = command[len(prefix):]
             break
 
     if target is None:
-
         for suffix in OPEN_SUFFIXES:
-
             if command.endswith(suffix):
-
                 target = command[:-len(suffix)]
                 break
 
     if target is None:
         return None
 
-    # "... in a new tab", "... on new chrome tab", "... in new window"
+    # "... in a new tab" / "... on new chrome window"
     target = re.sub(
         r"\b(in|on|into)\s+(a\s+|the\s+)?new\s+(chrome\s+)?(tab|window)\b",
         " ",
-        target
+        target,
     )
 
-    # "... in chrome", "... on google chrome"
-    target = re.sub(
-        r"\b(in|on)\s+(google\s+)?chrome\b",
-        " ",
-        target
-    )
+    # "... in chrome"
+    target = re.sub(r"\b(in|on)\s+(google\s+)?chrome\b", " ", target)
 
     # "flipkart dot com" -> "flipkart.com"
     target = re.sub(r"\s+dot\s+", ".", target)
 
-    # Filler words at the start / end
     target = re.sub(r"^(the|a|my)\s+", "", target.strip())
     target = re.sub(
         r"\s+(website|site|webpage|web page|please|for me|na|yaar)$",
         "",
-        target.strip()
+        target.strip(),
     )
 
-    # Collapse spaces
-    target = re.sub(r"\s+", " ", target).strip()
-
-    return target
+    return re.sub(r"\s+", " ", target).strip()
 
 
 def _matches(command, exact=(), starts=()):
-    """True if command equals one of `exact` or starts with one of `starts`."""
-
     if command in exact:
         return True
 
@@ -1638,72 +1169,34 @@ def _matches(command, exact=(), starts=()):
 
 
 # ============================================================
-# PROCESS COMMAND
+# SYSTEM COMMANDS
 # ============================================================
 
 def try_handle_system_command(command, announce=True):
-
     """
-    Detect and execute a non-RAG "system" command: opening an app
-    or website (in a NEW TAB), telling the time/date, setting a
-    reminder, or doing an explicit web search.
+    Detect and execute a non-RAG "system" command: open app/website,
+    time/date, reminder, explicit web search.
 
-    Used by:
-      - the standalone CLI loop (process_command)
-      - the Streamlit VOICE assistant
-      - the Streamlit TEXT chat
-
-    announce=True speaks the result through the local pyttsx3
-    engine (CLI). Pass announce=False when the caller wants to
-    display/speak the message itself (Streamlit).
-
-    Returns:
-        (handled, message)
-
-        handled -> True if this was a system command and it has
-                   already been executed. False means: treat
-                   `command` as a normal question for the RAG
-                   engine instead.
-        message -> human-readable response text (empty string
-                   when handled is False).
+    Returns (handled, message)
+      handled False -> caller should treat `command` as a RAG question.
     """
 
     def respond(message, handled=True):
-
         if announce and message:
             speak(message)
-
         return handled, message
 
     if not command:
         return False, ""
 
-    # --------------------------------------------------------
-    # CLEAN COMMAND
-    # --------------------------------------------------------
-
     command = command.strip().lower()
 
-    # FIX: the old version stripped every "." which destroyed
-    # domains ("open flipkart.com" -> "open flipkart com").
-    # Now a dot is only removed when it is NOT between two
-    # word characters.
+    # Remove dots only when NOT inside a domain (flipkart.com stays intact)
     command = re.sub(r"(?<![a-z0-9])\.|\.(?![a-z0-9])", " ", command)
-
-    # Remove other punctuation
     command = re.sub(r"[!?,]+", " ", command)
+    command = re.sub(r"\s+", " ", command).strip()
 
-    # Remove extra spaces
-    command = re.sub(
-        r"\s+",
-        " ",
-        command
-    ).strip()
-
-    print(
-        "\nProcessed command:",
-        command
-    )
+    print("\nProcessed command:", command)
 
     # ========================================================
     # OPEN APP / WEBSITE
@@ -1711,126 +1204,84 @@ def try_handle_system_command(command, announce=True):
 
     target = extract_open_target(command)
 
-    if target is not None and target:
+    if target:
 
-        # ----------------------------------------------------
-        # Desktop apps
-        # ----------------------------------------------------
+        # ---------------- Desktop apps (local only) ----------------
 
-        if target in ("chrome", "google chrome"):
+        desktop_targets = (
+            "chrome", "google chrome",
+            "visual studio code", "vs code", "vscode", "code",
+            "notepad",
+            "calculator", "calc",
+        )
 
-            chrome_paths = [
+        if target in desktop_targets:
 
-                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            if HOSTED:
 
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-
-                os.path.expandvars(
-                    r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
-                )
-            ]
-
-            chrome_path = None
-
-            for path in chrome_paths:
-
-                if os.path.exists(path):
-
-                    chrome_path = path
-
-                    break
-
-            if chrome_path:
-
-                subprocess.Popen(
-                    chrome_path
-                )
+                if target in ("chrome", "google chrome"):
+                    open_url_in_new_chrome_tab("https://www.google.com")
+                    return respond(
+                        "Opening Google in a new tab. "
+                        "Agar tab na khule, neeche wala button dabaiye."
+                    )
 
                 return respond(
-                    "Opening Google Chrome."
+                    f"{target} desktop app hai, online version par open nahi ho sakta."
                 )
 
-            webbrowser.open_new_tab(
-                "https://www.google.com"
-            )
+            if target in ("chrome", "google chrome"):
 
-            return respond(
-                "Opening Chrome."
-            )
+                chrome_paths = [
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                    os.path.expandvars(
+                        r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
+                    ),
+                ]
 
-        if target in (
-            "visual studio code",
-            "vs code",
-            "vscode",
-            "code"
-        ):
-
-            code_path = (
-                r"C:\Users\HP"
-                r"\AppData\Local"
-                r"\Programs"
-                r"\Microsoft VS Code"
-                r"\Code.exe"
-            )
-
-            if os.path.exists(code_path):
-
-                subprocess.Popen(
-                    code_path
+                chrome_path = next(
+                    (p for p in chrome_paths if os.path.exists(p)), None
                 )
 
-                return respond(
-                    "Opening Visual Studio Code."
+                if chrome_path:
+                    subprocess.Popen(chrome_path)
+                    return respond("Opening Google Chrome.")
+
+                webbrowser.open_new_tab("https://www.google.com")
+                return respond("Opening Chrome.")
+
+            if target in ("visual studio code", "vs code", "vscode", "code"):
+
+                code_path = (
+                    r"C:\Users\HP\AppData\Local\Programs"
+                    r"\Microsoft VS Code\Code.exe"
                 )
 
-            return respond(
-                "Visual Studio Code was not found."
-            )
+                if os.path.exists(code_path):
+                    subprocess.Popen(code_path)
+                    return respond("Opening Visual Studio Code.")
 
-        if target == "notepad":
+                return respond("Visual Studio Code was not found.")
 
-            subprocess.Popen(
-                "notepad.exe"
-            )
+            if target == "notepad":
+                subprocess.Popen("notepad.exe")
+                return respond("Opening Notepad.")
 
-            return respond(
-                "Opening Notepad."
-            )
+            if target in ("calculator", "calc"):
+                subprocess.Popen("calc.exe")
+                return respond("Opening Calculator.")
 
-        if target in ("calculator", "calc"):
-
-            subprocess.Popen(
-                "calc.exe"
-            )
-
-            return respond(
-                "Opening Calculator."
-            )
-
-        # ----------------------------------------------------
-        # Any website  ->  NEW TAB
-        #
-        # Guard: a long sentence such as
-        # "open source tools for machine learning kya hain"
-        # is a QUESTION, not a website name, so it is left for
-        # the RAG engine.
-        # ----------------------------------------------------
+        # ---------------- Any website -> NEW TAB ----------------
+        # Long sentences are questions, not website names.
 
         if len(target.split()) <= MAX_OPEN_TARGET_WORDS:
 
-            print(
-                "Website command detected:",
-                target
-            )
+            print("Website command detected:", target)
 
-            _success, message = search_and_open_website(
-                target,
-                announce=False
-            )
+            _success, message = search_and_open_website(target, announce=False)
 
-            return respond(
-                message
-            )
+            return respond(message)
 
     # ========================================================
     # TIME
@@ -1839,36 +1290,18 @@ def try_handle_system_command(command, announce=True):
     if _matches(
         command,
         exact=(
-            "time",
-            "current time",
-            "the time",
-            "time batao",
-            "samay batao",
-            "abhi kya time hua hai",
+            "time", "current time", "the time", "time batao",
+            "samay batao", "abhi kya time hua hai",
         ),
         starts=(
-            "what time is it",
-            "what is the time",
-            "what's the time",
-            "whats the time",
-            "tell me the time",
-            "what is the current time",
-            "what's the current time",
-        )
+            "what time is it", "what is the time", "what's the time",
+            "whats the time", "tell me the time",
+            "what is the current time", "what's the current time",
+        ),
     ):
-
-        now = datetime.datetime.now().strftime(
-            "%I:%M %p"
-        )
-
-        update_context(
-            command,
-            intent="time"
-        )
-
-        return respond(
-            f"The time is {now}"
-        )
+        now = datetime.datetime.now().strftime("%I:%M %p")
+        update_context(command, intent="time")
+        return respond(f"The time is {now}")
 
     # ========================================================
     # DATE
@@ -1877,38 +1310,18 @@ def try_handle_system_command(command, announce=True):
     if _matches(
         command,
         exact=(
-            "date",
-            "today's date",
-            "todays date",
-            "today date",
-            "aaj ki date batao",
-            "aaj ki tarikh batao",
+            "date", "today's date", "todays date", "today date",
+            "aaj ki date batao", "aaj ki tarikh batao",
         ),
         starts=(
-            "what date is it",
-            "what is the date",
-            "what's the date",
-            "whats the date",
-            "what is today's date",
-            "what's today's date",
-            "what is todays date",
-            "tell me the date",
-            "tell me today's date",
-        )
+            "what date is it", "what is the date", "what's the date",
+            "whats the date", "what is today's date", "what's today's date",
+            "what is todays date", "tell me the date", "tell me today's date",
+        ),
     ):
-
-        today = datetime.datetime.now().strftime(
-            "%d %B %Y"
-        )
-
-        update_context(
-            command,
-            intent="date"
-        )
-
-        return respond(
-            f"Today is {today}"
-        )
+        today = datetime.datetime.now().strftime("%d %B %Y")
+        update_context(command, intent="date")
+        return respond(f"Today is {today}")
 
     # ========================================================
     # REMINDER
@@ -1917,131 +1330,42 @@ def try_handle_system_command(command, announce=True):
     if command.startswith("remind me to"):
 
         try:
+            task = command.split("remind me to", 1)[1].strip()
 
-            task = (
-                command
-                .split(
-                    "remind me to",
-                    1
-                )[1]
-                .strip()
-            )
+            if " in " in task and "minute" in task:
 
-            # ------------------------------------------------
-            # MINUTES
-            # ------------------------------------------------
+                message = task.split(" in ", 1)[0].strip()
+                minutes = int(task.split(" in ", 1)[1].split()[0])
 
-            if (
-                " in " in task
-                and
-                "minute" in task
-            ):
-
-                message = (
-                    task
-                    .split(
-                        " in ",
-                        1
-                    )[0]
-                    .strip()
-                )
-
-                time_part = (
-                    task
-                    .split(
-                        " in ",
-                        1
-                    )[1]
-                )
-
-                minutes = int(
-                    time_part.split()[0]
-                )
-
-                update_context(
-                    command,
-                    intent="reminder"
-                )
-
-                set_reminder(
-                    message,
-                    minutes * 60
-                )
+                update_context(command, intent="reminder")
+                set_reminder(message, minutes * 60)
 
                 return respond(
-                    f"Reminder set. "
-                    f"I will remind you to "
-                    f"{message} in "
-                    f"{minutes} minutes."
+                    f"Reminder set. I will remind you to {message} "
+                    f"in {minutes} minutes."
                 )
 
-            # ------------------------------------------------
-            # HOURS
-            # ------------------------------------------------
+            if " in " in task and "hour" in task:
 
-            if (
-                " in " in task
-                and
-                "hour" in task
-            ):
+                message = task.split(" in ", 1)[0].strip()
+                hours = int(task.split(" in ", 1)[1].split()[0])
 
-                message = (
-                    task
-                    .split(
-                        " in ",
-                        1
-                    )[0]
-                    .strip()
-                )
-
-                time_part = (
-                    task
-                    .split(
-                        " in ",
-                        1
-                    )[1]
-                )
-
-                hours = int(
-                    time_part.split()[0]
-                )
-
-                update_context(
-                    command,
-                    intent="reminder"
-                )
-
-                set_reminder(
-                    message,
-                    hours * 3600
-                )
+                update_context(command, intent="reminder")
+                set_reminder(message, hours * 3600)
 
                 return respond(
-                    f"Reminder set. "
-                    f"I will remind you to "
-                    f"{message} in "
-                    f"{hours} hours."
+                    f"Reminder set. I will remind you to {message} "
+                    f"in {hours} hours."
                 )
 
-            return respond(
-                "Please specify the reminder time in minutes or hours."
-            )
+            return respond("Please specify the reminder time in minutes or hours.")
 
         except Exception as e:
-
-            print(
-                "Reminder error:",
-                e
-            )
-
-            return respond(
-                "I could not understand the reminder time."
-            )
+            print("Reminder error:", e)
+            return respond("I could not understand the reminder time.")
 
     # ========================================================
-    # EXPLICIT WEB SEARCH
-    # ========================================================
-    # Also accepts Hinglish: "google karo ...", "search karo ..."
+    # EXPLICIT WEB SEARCH  (also Hinglish: "google karo ...")
     # ========================================================
 
     SEARCH_PREFIXES = (
@@ -2053,93 +1377,58 @@ def try_handle_system_command(command, announce=True):
         "google karo ",
     )
 
-    matched_prefix = None
-
-    for prefix in SEARCH_PREFIXES:
-
-        if command.startswith(prefix):
-
-            matched_prefix = prefix
-            break
+    matched_prefix = next(
+        (p for p in SEARCH_PREFIXES if command.startswith(p)), None
+    )
 
     if matched_prefix:
 
         query = command[len(matched_prefix):].strip()
 
-        # "... search karo" style at the end
-        query = re.sub(
-            r"\s+(karo|kar do|kijiye|please)$",
-            "",
-            query
-        ).strip()
+        query = re.sub(r"\s+(karo|kar do|kijiye|please)$", "", query).strip()
 
         if not query:
+            return respond("What should I search for?")
 
-            return respond(
-                "What should I search for?"
-            )
-
-        update_context(
-            command,
-            intent="web_search",
-            topic=query
-        )
+        update_context(command, intent="web_search", topic=query)
 
         answer = None
         web_sources = []
 
-        # --------------------------------------------------
-        # Preferred path: let rag_engine summarise the web
-        # --------------------------------------------------
-
         try:
-
             answer, web_sources = rag_engine.answer_from_web(query)
 
         except rag_engine.RateLimitError as e:
-
-            return respond(
-                f"Groq ka daily token limit khatam ho gaya hai. {e}"
-            )
+            return respond(f"Groq ka daily token limit khatam ho gaya hai. {e}")
 
         except Exception as e:
-
             print("rag_engine web search failed:", e)
             answer = None
 
-        # --------------------------------------------------
-        # Fallback: raw results from our own safe searcher,
-        # so the user still gets something useful even when
-        # rag_engine's search path is broken or throttled.
-        # --------------------------------------------------
-
+        # Fallback: raw results from our own searcher
         if not answer:
 
             web_sources = web_search(query, max_results=5)
 
             if not web_sources:
-
                 return respond(
                     "Web search abhi available nahi hai. "
                     "Thodi der baad try kijiye."
                 )
 
-            answer = web_sources[0].get("body") or (
-                "Yeh top results mile:"
-            )
+            answer = web_sources[0].get("body") or "Yeh top results mile:"
 
         sources_text = format_web_sources(web_sources)
 
         full_message = answer
 
         if sources_text:
-
             full_message += "\n\n" + sources_text
 
         return respond(full_message)
 
     # ========================================================
-    # NOT A SYSTEM COMMAND — let the caller run RAG instead
+    # NOT A SYSTEM COMMAND - let the caller run RAG instead
     # ========================================================
 
     return False, ""
@@ -2154,49 +1443,27 @@ def process_command(command):
     if not command:
         return
 
-    handled, _message = try_handle_system_command(
-        command,
-        announce=True
-    )
+    handled, _message = try_handle_system_command(command, announce=True)
 
     if handled:
         return
 
-    # ========================================================
-    # DOCUMENT / WEB / GENERAL QUESTION
-    # ========================================================
-
     db = get_document_db()
 
-    answer, reference_note, _sources, source_type = (
-        voice_answer(
-            command,
-            db,
-            conversation_context
-        )
+    answer, reference_note, _sources, source_type = voice_answer(
+        command, db, conversation_context
     )
 
-    update_context(
-        command=command,
-        intent="question"
-    )
+    update_context(command=command, intent="question")
 
     speak(answer)
 
-    if (
-        source_type != "error"
-        and
-        reference_note
-    ):
-
-        print(
-            "\n"
-            + reference_note
-        )
+    if source_type != "error" and reference_note:
+        print("\n" + reference_note)
 
 
 # ============================================================
-# MICROPHONE TEST
+# TESTS
 # ============================================================
 
 def test_microphone():
@@ -2208,29 +1475,16 @@ def test_microphone():
     audio = record_speech()
 
     if audio is None:
-
-        print(
-            "No audio captured."
-        )
-
+        print("No audio captured.")
         return
 
-    text = transcribe_audio(
-        audio
-    )
+    text = transcribe_audio(audio)
 
     print("=" * 60)
     print("FINAL TRANSCRIPT")
     print("=" * 60)
-
     print(text)
 
-
-# ============================================================
-# WEB SEARCH TEST
-# ============================================================
-# Run:  python -c "import voice_assistant as v; v.test_search()"
-# ============================================================
 
 def test_search(query="python official website"):
 
@@ -2242,7 +1496,7 @@ def test_search(query="python official website"):
     results = web_search(query, max_results=5)
 
     if not results:
-        print("NO RESULTS — every backend failed or is rate limited.")
+        print("NO RESULTS - every backend failed or is rate limited.")
         return
 
     for index, result in enumerate(results, start=1):
@@ -2256,39 +1510,18 @@ def test_search(query="python official website"):
 
 if __name__ == "__main__":
 
-    speak(
-        "Hello, I am your AI Research Assistant. "
-        "Ask me anything."
-    )
+    speak("Hello, I am your AI Research Assistant. Ask me anything.")
 
     while True:
 
         question = listen()
 
         if not question:
-
-            speak(
-                "Sorry, I could not "
-                "understand you."
-            )
-
+            speak("Sorry, I could not understand you.")
             continue
 
-        # Exit commands
-        if question in [
-            "exit",
-            "quit",
-            "stop",
-            "goodbye",
-            "close assistant"
-        ]:
-
-            speak(
-                "Goodbye. Have a great day."
-            )
-
+        if question in ["exit", "quit", "stop", "goodbye", "close assistant"]:
+            speak("Goodbye. Have a great day.")
             break
 
-        process_command(
-            question
-        )
+        process_command(question)

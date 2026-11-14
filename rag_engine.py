@@ -2,126 +2,190 @@ import os
 import re
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
-
 from langchain_community.vectorstores import FAISS
 
 from ingest import get_embeddings
-from analysis_report import (
-    strong_llm,
-    safe_llm_invoke,
-    RateLimitError,
-)
+from analysis_report import strong_llm, safe_llm_invoke, RateLimitError
 
 load_dotenv()
 
 VECTORSTORE_PATH = "vectorstore"
+SEARCH_CACHE = {}
+SEARCH_TIMEOUT = 30
 
 
 # -------------------------------------------------
 # Load FAISS safely
 # -------------------------------------------------
-
 def load_vectorstore():
     """Load the FAISS vector database if it exists."""
-
     if not os.path.exists(VECTORSTORE_PATH):
         return None
 
     try:
-        db = FAISS.load_local(
+        return FAISS.load_local(
             VECTORSTORE_PATH,
             get_embeddings(),
-            allow_dangerous_deserialization=True
+            allow_dangerous_deserialization=True,
         )
-        return db
-
     except Exception as e:
         print(f"Error loading vector database: {e}")
         return None
 
 
 # -------------------------------------------------
-# Web Search: DDGS -> Tavily (optional) -> Wikipedia
+# Web search helpers
+# Priority: Tavily -> DuckDuckGo -> Wikipedia
 # -------------------------------------------------
-
-_SEARCH_CACHE = {}
-
-
 def _format_results(results):
+    """Normalize search results from different providers."""
     formatted = []
-    for r in results:
-        title = (r.get("title") or "").strip()
-        url = (r.get("href") or r.get("url") or "").strip()
-        snippet = (
-            r.get("body") or r.get("snippet") or r.get("content") or ""
+    seen_urls = set()
+
+    for result in results or []:
+        if not isinstance(result, dict):
+            continue
+
+        title = str(result.get("title") or "").strip()
+        url = str(
+            result.get("url")
+            or result.get("href")
+            or result.get("link")
+            or ""
         ).strip()
-        if title or url or snippet:
-            formatted.append({"title": title, "url": url, "snippet": snippet})
+
+        content = str(
+            result.get("raw_content")
+            or result.get("content")
+            or result.get("body")
+            or result.get("snippet")
+            or result.get("description")
+            or ""
+        ).strip()
+
+        if not url.startswith(("http://", "https://")):
+            continue
+        if url in seen_urls or not (title or content):
+            continue
+
+        seen_urls.add(url)
+        formatted.append({
+            "title": title or urlparse(url).netloc,
+            "url": url,
+            "snippet": content[:8000],
+        })
+
     return formatted
 
 
+# -------------------------------------------------
+# Tavily Search (Primary)
+# -------------------------------------------------
+def _search_tavily(query, max_results):
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        print("[WEB SEARCH] Tavily API key not configured")
+        return []
+
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query,
+                "topic": "general",
+                "search_depth": "advanced",
+                "max_results": max_results,
+                "include_raw_content": "text",
+            },
+            timeout=SEARCH_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        results = _format_results(data.get("results", []))
+        print(f"[WEB SEARCH] Tavily: {len(results)} results")
+        return results
+
+    except requests.RequestException as e:
+        print(f"[WEB SEARCH ERROR] Tavily request: {e}")
+    except (ValueError, TypeError) as e:
+        print(f"[WEB SEARCH ERROR] Tavily response: {e}")
+    except Exception as e:
+        print(f"[WEB SEARCH ERROR] Tavily: {type(e).__name__}: {e}")
+
+    return []
+
+
+# -------------------------------------------------
+# DuckDuckGo Search (Fallback)
+# -------------------------------------------------
 def _search_ddgs(query, max_results):
     try:
         from ddgs import DDGS
     except ImportError:
-        from duckduckgo_search import DDGS
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            print("[WEB SEARCH] Install DDGS: pip install -U ddgs")
+            return []
 
-    for backend in ("auto", "duckduckgo", "bing", "brave", "yahoo"):
+    backends = ("auto", "duckduckgo", "bing", "brave", "yahoo")
+
+    for backend in backends:
         for attempt in range(2):
             try:
                 with DDGS() as ddgs:
                     try:
-                        results = list(ddgs.text(
+                        raw_results = ddgs.text(
                             query,
                             max_results=max_results,
-                            region="wt-wt",
+                            region="in-en",
                             safesearch="moderate",
                             backend=backend,
-                        ))
+                        )
                     except TypeError:
-                        results = list(ddgs.text(query, max_results=max_results))
+                        # Compatibility with older DDGS package versions.
+                        raw_results = ddgs.text(
+                            query,
+                            max_results=max_results,
+                            region="in-en",
+                            safesearch="moderate",
+                        )
 
-                formatted = _format_results(results)
-                if formatted:
-                    print(f"[WEB SEARCH] ddgs/{backend}: {len(formatted)} results")
-                    return formatted
+                    results = _format_results(list(raw_results or []))
 
-                print(f"[WEB SEARCH] ddgs/{backend}: 0 results")
+                if results:
+                    print(
+                        f"[WEB SEARCH] DuckDuckGo/{backend}: "
+                        f"{len(results)} results"
+                    )
+                    return results
+
+                print(f"[WEB SEARCH] DuckDuckGo/{backend}: 0 results")
                 break
+
             except Exception as e:
                 print(
-                    f"[WEB SEARCH ERROR] ddgs/{backend} try {attempt + 1}: "
-                    f"{type(e).__name__}: {e}"
+                    f"[WEB SEARCH ERROR] DuckDuckGo/{backend} "
+                    f"attempt {attempt + 1}: {type(e).__name__}: {e}"
                 )
-                time.sleep(1.5)
+                if attempt == 0:
+                    time.sleep(1.5)
+
     return []
 
 
-def _search_tavily(query, max_results):
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return []
-    try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            json={"api_key": api_key, "query": query, "max_results": max_results},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        formatted = _format_results(resp.json().get("results", []))
-        print(f"[WEB SEARCH] tavily: {len(formatted)} results")
-        return formatted
-    except Exception as e:
-        print(f"[WEB SEARCH ERROR] tavily: {type(e).__name__}: {e}")
-        return []
-
-
+# -------------------------------------------------
+# Wikipedia Search (Last Fallback)
+# -------------------------------------------------
 def _search_wikipedia(query, max_results):
     try:
-        resp = requests.get(
+        response = requests.get(
             "https://en.wikipedia.org/w/api.php",
             params={
                 "action": "query",
@@ -131,78 +195,87 @@ def _search_wikipedia(query, max_results):
                 "prop": "extracts|info",
                 "exintro": 1,
                 "explaintext": 1,
-                "exchars": 1500,
+                "exchars": 3000,
                 "inprop": "url",
                 "format": "json",
             },
-            headers={"User-Agent": "RAGAssistant/1.0 (student project)"},
-            timeout=15,
+            headers={"User-Agent": "RAGAssistant/1.0 (educational project)"},
+            timeout=SEARCH_TIMEOUT,
         )
-        resp.raise_for_status()
-        pages = (resp.json().get("query") or {}).get("pages", {})
-        ordered = sorted(pages.values(), key=lambda p: p.get("index", 99))
-        results = [
+        response.raise_for_status()
+
+        pages = (response.json().get("query") or {}).get("pages", {})
+        ordered_pages = sorted(
+            pages.values(),
+            key=lambda page: page.get("index", 999),
+        )
+
+        raw_results = [
             {
-                "title": f"{p.get('title', '')} - Wikipedia",
-                "url": p.get("fullurl", ""),
-                "snippet": p.get("extract", ""),
+                "title": f"{page.get('title', '')} - Wikipedia",
+                "url": page.get("fullurl", ""),
+                "content": page.get("extract", ""),
             }
-            for p in ordered
-            if p.get("extract")
+            for page in ordered_pages
+            if page.get("extract") and page.get("fullurl")
         ]
-        print(f"[WEB SEARCH] wikipedia: {len(results)} results")
+
+        results = _format_results(raw_results)
+        print(f"[WEB SEARCH] Wikipedia: {len(results)} results")
         return results
+
     except Exception as e:
-        print(f"[WEB SEARCH ERROR] wikipedia: {type(e).__name__}: {e}")
+        print(f"[WEB SEARCH ERROR] Wikipedia: {type(e).__name__}: {e}")
         return []
 
 
+# -------------------------------------------------
+# Main Web Search Router
+# -------------------------------------------------
 def web_search(query, max_results=5):
-    """DDGS -> Tavily (if key set) -> Wikipedia. Successful results are cached."""
+    """Search using Tavily first, then DDGS, then Wikipedia."""
+    query = (query or "").strip()
+    if not query:
+        return []
 
-    key = query.strip().lower()
-    if key in _SEARCH_CACHE:
-        print("[WEB SEARCH] cache hit")
-        return _SEARCH_CACHE[key]
+    cache_key = (query.lower(), max_results)
+    if cache_key in SEARCH_CACHE:
+        print("[WEB SEARCH] Cache hit")
+        return SEARCH_CACHE[cache_key]
 
     print(f"[WEB SEARCH] Query: {query}")
 
-    for engine in (_search_ddgs, _search_tavily, _search_wikipedia):
-        results = engine(query, max_results)
+    search_engines = (
+        ("Tavily", _search_tavily),
+        ("DuckDuckGo", _search_ddgs),
+        ("Wikipedia", _search_wikipedia),
+    )
+
+    for engine_name, engine_function in search_engines:
+        results = engine_function(query, max_results)
         if results:
-            _SEARCH_CACHE[key] = results
+            SEARCH_CACHE[cache_key] = results
+            print(f"[WEB SEARCH] Selected provider: {engine_name}")
             return results
 
-    print("[WEB SEARCH] all engines failed")
+    print("[WEB SEARCH] All search providers failed")
     return []
 
 
+# -------------------------------------------------
+# Build contexts
+# -------------------------------------------------
 def build_web_context(search_results):
-
     if not search_results:
         return ""
 
     context_parts = []
-
     for index, result in enumerate(search_results, start=1):
-
-        title = result.get("title", "Unknown")
-        url = result.get("url", "")
-        snippet = result.get("snippet", "")
-
         context_parts.append(
-            f"""
-SOURCE {index}
-
-Title:
-{title}
-
-URL:
-{url}
-
-Content:
-{snippet}
-"""
+            f"SOURCE {index}\n"
+            f"Title: {result.get('title', 'Unknown')}\n"
+            f"URL: {result.get('url', '')}\n"
+            f"Content: {result.get('snippet', '')}\n"
         )
 
     return "\n\n".join(context_parts)
@@ -217,27 +290,25 @@ def build_doc_context(docs):
 # -------------------------------------------------
 # Answer From Uploaded Documents
 # -------------------------------------------------
-
 def _dedupe_docs(docs):
-    """Remove duplicate (file, page) entries, keep order."""
+    """Remove duplicate (file, page) entries while preserving order."""
     seen = set()
     unique = []
-    for d in docs:
-        key = (d.metadata.get("source"), d.metadata.get("page"))
+
+    for doc in docs:
+        key = (
+            doc.metadata.get("source"),
+            doc.metadata.get("page"),
+        )
         if key not in seen:
             seen.add(key)
-            unique.append(d)
+            unique.append(doc)
+
     return unique
 
 
 def answer_from_documents(question, db):
-    """
-    Answer using uploaded documents only.
-    Returns (answer, used_docs) where used_docs contains ONLY the
-    chunks the LLM actually used to answer (not every retrieved chunk).
-    Returns ("NOT_FOUND", []) if the documents can't answer.
-    """
-
+    """Answer only from uploaded documents; return NOT_FOUND if unsupported."""
     if db is None:
         return "NOT_FOUND", []
 
@@ -247,84 +318,77 @@ def answer_from_documents(question, db):
         print(f"Document retrieval error: {e}")
         return "NOT_FOUND", []
 
-    docs = [d for d in docs if d.page_content.strip()]
-
+    docs = [doc for doc in docs if doc.page_content.strip()]
     if not docs:
         return "NOT_FOUND", []
 
     context = "\n\n".join(
-        f"[CHUNK {i}] (file: "
-        f"{os.path.basename(str(d.metadata.get('source', 'Unknown')))}, "
-        f"page: {d.metadata.get('page', '?')})\n{d.page_content}"
-        for i, d in enumerate(docs, start=1)
+        f"[CHUNK {index}] (file: "
+        f"{os.path.basename(str(doc.metadata.get('source', 'Unknown')))}, "
+        f"page: {doc.metadata.get('page', '?')})\n{doc.page_content}"
+        for index, doc in enumerate(docs, start=1)
     )
 
     prompt = f"""
 You are an intelligent AI document assistant.
+Answer the user's question using ONLY the uploaded document chunks below.
 
-Your task is to answer the user's question using ONLY the
-uploaded document chunks provided below.
+Rules:
+1. Use only chunks that directly answer the question.
+2. Ignore merely related or unrelated chunks.
+3. Do not invent information or use outside knowledge.
+4. Use reasonable inference only when clearly supported by the chunks.
+5. If the chunks do not contain enough information, respond exactly: NOT_FOUND
+6. Do not mention chunk numbers, filenames, or sources in the answer.
+7. After the answer, add one final line listing only the chunk numbers used:
+   USED_CHUNKS: 1,3
+8. Do not add USED_CHUNKS when the answer is NOT_FOUND.
 
-IMPORTANT RULES:
-
-1. Use only the chunks that directly answer the question.
-   Ignore chunks that are merely related or unrelated.
-2. Do not invent information.
-3. Do not use outside knowledge.
-4. If the chunks clearly contain the answer, answer naturally.
-5. If the chunks do NOT contain enough information to answer
-   the question, respond with exactly:
-
-NOT_FOUND
-
-6. Do not say NOT_FOUND merely because the answer is not written
-   word-for-word. Use reasonable inference when clearly supported.
-7. Do not mention chunk numbers, file names, or sources inside
-   the answer text.
-8. After the answer, add ONE final line in exactly this format,
-   listing ONLY the chunk numbers you actually used:
-
-USED_CHUNKS: 1,3
-
-   (Do not add this line when the answer is NOT_FOUND.)
-
-Uploaded Document Chunks:
---------------------------
+UPLOADED DOCUMENT CHUNKS:
+-------------------------
 {context}
---------------------------
+-------------------------
 
-User Question:
+USER QUESTION:
 {question}
 """
 
     raw = safe_llm_invoke(strong_llm, prompt)
-
-    if not raw or not raw.strip():
+    if not raw or not str(raw).strip():
         return "NOT_FOUND", []
 
-    # ---- parse USED_CHUNKS line and strip it from the answer ----
+    raw = str(raw).strip()
     used_indices = []
-    match = re.search(r"USED_CHUNKS:\s*([\d,\s]*)", raw, re.IGNORECASE)
+    match = re.search(
+        r"USED_CHUNKS:\s*([\d,\s]+)",
+        raw,
+        flags=re.IGNORECASE,
+    )
 
     if match:
         used_indices = [
-            int(n) for n in re.findall(r"\d+", match.group(1))
+            int(number)
+            for number in re.findall(r"\d+", match.group(1))
         ]
         answer = re.sub(
-            r"\n?\s*USED_CHUNKS:.*$", "", raw,
-            flags=re.IGNORECASE | re.DOTALL
+            r"\n?\s*USED_CHUNKS:\s*[\d,\s]+\s*$",
+            "",
+            raw,
+            flags=re.IGNORECASE,
         ).strip()
     else:
-        answer = raw.strip()
+        answer = raw
 
     if _is_not_found(answer):
         return "NOT_FOUND", []
 
     used_docs = [
-        docs[i - 1] for i in used_indices if 1 <= i <= len(docs)
+        docs[index - 1]
+        for index in used_indices
+        if 1 <= index <= len(docs)
     ]
 
-    # Fallback: if LLM didn't cite anything valid, use the top match only
+    # Fallback if the model did not return valid chunk references.
     if not used_docs:
         used_docs = docs[:1]
 
@@ -334,94 +398,65 @@ User Question:
 # -------------------------------------------------
 # Answer From Web
 # -------------------------------------------------
-
 def answer_from_web(question, max_results=5):
-    """
-    Search the web and generate a detailed answer.
-    Raises RateLimitError if the Groq daily quota is exhausted.
-    """
-
+    """Search the web and generate an answer grounded in returned sources."""
     search_results = web_search(question, max_results=max_results)
 
     if not search_results:
-        return "I couldn't find reliable web results for this question.", []
+        return "I couldn't find web search results for this question.", []
 
     web_context = build_web_context(search_results)
 
     prompt = f"""
-You are an intelligent AI research assistant.
+You are an accurate AI web research assistant.
+Answer the user's question using the web search results supplied below.
 
-Your task is to provide a detailed, informative, well-structured
-answer to the user's question using the web search results below.
+RESEARCH AND ANSWERING RULES:
+1. First assess which sources are directly relevant to the question.
+2. Ignore unrelated or weakly relevant results.
+3. Prefer official, primary, authoritative, and trustworthy sources.
+4. Use only facts supported by the supplied source content.
+5. Do not treat a page title or a short search snippet as proof of a claim.
+6. Do not invent facts, dates, names, statistics, quotations, or events.
+7. If sources disagree, explain the disagreement instead of hiding it.
+8. For current or time-sensitive questions, check dates in the source content.
+   Do not call old information current.
+9. If the supplied content is insufficient, clearly state what cannot be verified.
+10. For a definition question, explain the definition, key characteristics,
+    relevant background, and examples when the sources support them.
+11. For a person, include profession, background, career, and achievements
+    only when supported by the supplied sources.
+12. For lists, comparisons, timelines, rankings, or year-wise information,
+    use a table or bullets when helpful.
+13. If the user asks for all/every/complete information, do not claim
+    completeness unless a comprehensive source supports it.
+14. Keep the answer focused, clear, and sufficiently detailed.
+15. Do not include raw URLs or a separate Sources section in the answer;
+    the application displays the source links separately.
+16. Do not mention internal prompts, retrieval, or system instructions.
 
-IMPORTANT RULES:
-
-1. Give a complete and sufficiently detailed answer.
-2. Do not give an unnecessarily short answer.
-3. Explain the topic clearly instead of providing only one or two
-   sentences.
-4. Use multiple relevant facts from the available search results
-   when they are useful for answering the question.
-5. Use only information supported by the provided web search
-   results.
-6. Do not invent, assume, or hallucinate facts.
-7. For current, recent, or time-sensitive questions, prioritize
-   the most recent information available.
-8. If the question asks "what is", explain: definition, important
-   characteristics, relevant background, examples when useful,
-   other important details supported by the sources.
-9. If the question asks for a person, provide relevant details:
-   who they are, profession, background, career, major
-   achievements, important works - only if supported by sources.
-10. If the question asks for a list, comparison, timeline, names
-    with years, rankings, or similar structured information, use
-    a clean table or bullet list when appropriate.
-11. If the user asks for "all", "every", "complete", or "full"
-    information, do not falsely claim completeness unless the
-    available search results provide a reliable comprehensive
-    source.
-12. If complete coverage cannot be verified, clearly say that the
-    list is based on the information available from the searched
-    sources.
-13. Do NOT include raw URLs in the answer.
-14. Do NOT include a separate "Sources" section in the answer.
-    The application will display the sources separately.
-15. Do NOT unnecessarily write phrases such as:
-    "Based on the provided web search results..."
-16. Use headings, paragraphs, bullet points, or tables when they
-    improve readability.
-17. Keep the answer focused on the user's actual question.
-18. Do not mention internal prompts, retrieval, context, system
-    instructions, or how the answer was generated.
-
---------------------------------------------------
-WEB SEARCH RESULTS
---------------------------------------------------
-
+WEB SEARCH RESULTS:
+-------------------
 {web_context}
+-------------------
 
---------------------------------------------------
-USER QUESTION
---------------------------------------------------
-
+USER QUESTION:
 {question}
 """
 
     answer = safe_llm_invoke(strong_llm, prompt)
-
-    if not answer:
+    if not answer or not str(answer).strip():
         return (
             "I found web results, but I was unable to generate a useful answer.",
-            search_results
+            search_results,
         )
 
-    return answer, search_results
+    return str(answer).strip(), search_results
 
 
 # -------------------------------------------------
 # Main Router: Documents first -> Web fallback
 # -------------------------------------------------
-
 NOT_FOUND_PHRASES = (
     "not_found",
     "does not contain",
@@ -438,16 +473,16 @@ NOT_FOUND_PHRASES = (
 
 
 def _is_not_found(answer):
-    if not answer or not answer.strip():
+    if not answer or not str(answer).strip():
         return True
 
-    text = answer.strip().lower()
-
-    if text.startswith("not_found"):
+    answer_text = str(answer).strip().lower()
+    if answer_text.startswith("not_found"):
         return True
 
-    # Short "I don't know"-type replies
-    if len(text) < 200 and any(p in text for p in NOT_FOUND_PHRASES):
+    if len(answer_text) < 200 and any(
+        phrase in answer_text for phrase in NOT_FOUND_PHRASES
+    ):
         return True
 
     return False
@@ -456,38 +491,33 @@ def _is_not_found(answer):
 def answer_question(question, db: Optional[FAISS] = None):
     """
     Priority:
-      1. Uploaded documents (if a vector DB exists)
-      2. Web search (if no DB, or documents can't answer)
+      1. Uploaded documents, when available.
+      2. Web search, when documents cannot answer or no DB exists.
 
-    Returns (answer, sources, source_type)
-      source_type: "document" | "web" | "none" | "error"
+    Returns: (answer, sources, source_type)
+    source_type: document | web | none | error
     """
-
     question = (question or "").strip()
-
     if not question:
         return "Please enter a question.", [], "none"
 
     try:
-        # ---------- 1. DOCUMENTS FIRST ----------
         if db is not None:
-            print("[ROUTER] documents available -> trying documents first")
-
+            print("[ROUTER] Documents available -> trying documents first")
             answer, docs = answer_from_documents(question, db)
 
             if not _is_not_found(answer):
-                print("[ROUTER] answered from DOCUMENTS")
+                print("[ROUTER] Answered from DOCUMENTS")
                 return answer, docs, "document"
 
-            print("[ROUTER] documents could not answer -> web fallback")
+            print("[ROUTER] Documents could not answer -> web fallback")
         else:
-            print("[ROUTER] no documents uploaded -> web search")
+            print("[ROUTER] No documents uploaded -> web search")
 
-        # ---------- 2. WEB FALLBACK ----------
         web_answer, web_sources = answer_from_web(question)
 
         if web_sources:
-            print("[ROUTER] answered from WEB")
+            print("[ROUTER] Answered from WEB")
             return web_answer, web_sources, "web"
 
         return web_answer, [], "none"
@@ -506,11 +536,8 @@ def answer_question(question, db: Optional[FAISS] = None):
 # -------------------------------------------------
 # Standalone Test
 # -------------------------------------------------
-
 if __name__ == "__main__":
-
     question = input("Ask a question: ").strip()
-
     db = load_vectorstore()
 
     answer, sources, source_type = answer_question(question, db)
@@ -518,15 +545,15 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("SOURCE TYPE:")
     print(source_type)
-
     print("\nANSWER:")
     print(answer)
-
     print("\nSOURCES:")
 
     if source_type == "document":
         for source in sources:
-            filename = os.path.basename(source.metadata.get("source", "Unknown"))
+            filename = os.path.basename(
+                source.metadata.get("source", "Unknown")
+            )
             page = source.metadata.get("page", "?")
             print(f"- {filename} (Page {page})")
 
@@ -536,6 +563,6 @@ if __name__ == "__main__":
             print(f"  {source.get('url', '')}")
 
     elif source_type == "error":
-        print("(Groq rate limit - see answer above)")
+        print("(See error message above.)")
 
     print("=" * 60)
